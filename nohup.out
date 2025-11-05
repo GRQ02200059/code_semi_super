@@ -1,0 +1,2 @@
+usage: train_and_test.py [-h] -c CONFIG [--predict] [--nohup] [--test-only]
+train_and_test.py: error: the following arguments are required: -c/--config

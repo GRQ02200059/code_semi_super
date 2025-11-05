@@ -1,13 +1,64 @@
 from datetime import datetime
 from functools import partial
 from pathlib import Path
+import sys
+import os
+import torch
+import numpy as np
+import random
+
+# 动态添加当前项目的src目录到Python路径
+current_dir = Path(__file__).parent.parent
+src_dir = current_dir / "src"
+if str(src_dir) not in sys.path:
+    sys.path.insert(0, str(src_dir))
+
+# 全局种子常量
+SEED = 42
+
+
+def setup_reproducible_training(seed: int = SEED):
+    """设置随机种子确保结果可重现"""
+    # 设置环境变量确保完全的确定性
+    os.environ['PYTHONHASHSEED'] = str(seed)
+    
+    # 设置所有随机种子
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    np.random.seed(seed)
+    random.seed(seed)
+    
+    # 设置PyTorch的确定性行为
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+
+# 配置日志
+from loguru import logger as log
+
+# 设置更详细的日志格式
+log.remove()
+log.add(
+    sys.stderr,
+    format="<green>{time:YYYY-MM-DD HH:mm:ss.SSS}</green> | <level>{level: <8}</level> | <cyan>{name}</cyan>:<cyan>{function}</cyan>:<cyan>{line}</cyan> - <level>{message}</level>",
+    level="INFO",
+    colorize=True,
+)
+# 添加文件日志
+os.makedirs("logs", exist_ok=True)
+log.add(
+    "logs/training_{time}.log",
+    format="{time:YYYY-MM-DD HH:mm:ss.SSS} | {level: <8} | {name}:{function}:{line} - {message}",
+    level="DEBUG",
+    rotation="500 MB",
+)
 
 from argdantic import ArgField, ArgParser
-from loguru import logger as log
 from mmengine import Config
 from pytorch_lightning import Trainer, seed_everything
 from pytorch_lightning.callbacks import ModelCheckpoint
 from pytorch_lightning.loggers import TensorBoardLogger
+import pytorch_lightning.callbacks
 
 from baseg.datamodules import EMSDataModule
 from baseg.io import read_raster_profile, write_raster
@@ -25,6 +76,11 @@ def train(
         "-k", default=False, description="Keep the experiment name as specified in the config file."
     ),
 ):
+    # 设置随机种子确保结果可重现
+    setup_reproducible_training(SEED)
+    seed_everything(SEED, workers=True)
+    log.info(f"Random seed set to {SEED} for reproducibility")
+    
     log.info(f"Loading config from: {cfg_path}")
     config = Config.fromfile(cfg_path)
     # set the experiment name
@@ -35,32 +91,136 @@ def train(
 
     # datamodule
     log.info("Preparing the data module...")
-    datamodule = EMSDataModule(**config["data"])
+    # 如果配置中没有seed参数，则添加默认值
+    if "seed" not in config["data"]:
+        config["data"]["seed"] = SEED
+    
+    # 检查是否为半监督学习配置
+    if "labeled_ratio" in config["data"] or "consistency_augmentation" in config["data"]:
+        from baseg.datamodules_semi import SemiSupervisedEMSDataModule
+        datamodule = SemiSupervisedEMSDataModule(**config["data"])
+        log.info("Using SemiSupervisedEMSDataModule for semi-supervised learning")
+    else:
+        datamodule = EMSDataModule(**config["data"])
+        log.info("Using EMSDataModule for supervised learning")
+    
+    log.info(f"Data configuration: {config['data']}")
 
     # prepare the model
     log.info("Preparing the model...")
     model_config = config["model"]
+    log.info(f"Model configuration: {model_config['type']}")
     loss = config["loss"] if "loss" in config else "bce"
-    module_class = MultiTaskModule if "aux_classes" in model_config["decode_head"] else SingleTaskModule
-    module = module_class(model_config, loss=loss, mask_lc=config["mask_lc"]) if "mask_lc" in config else module_class(model_config, loss=loss) 
+    log.info(f"Using loss function: {loss}")
+    
+    # 检查是否为半监督学习配置
+    if "labeled_ratio" in config["data"] or "consistency_augmentation" in config["data"]:
+        from baseg.modules.semi_supervised import SemiSupervisedModule
+        module_class = SemiSupervisedModule
+        log.info("Using SemiSupervisedModule for semi-supervised learning")
+        
+        # 半监督模块需要额外的参数
+        semi_config = config.get("semi_supervised", {})
+        module = module_class(
+            model_config,
+            loss=loss,
+            pseudo_threshold=semi_config.get("pseudo_threshold", 0.95),
+            consistency_weight=semi_config.get("consistency_weight", 1.0),
+            pseudo_weight=semi_config.get("pseudo_weight", 1.0),
+            ramp_up_epochs=semi_config.get("ramp_up_epochs", 10),
+            ema_decay=semi_config.get("ema_decay", 0.99),
+            use_ema_teacher=semi_config.get("use_ema_teacher", True),
+        )
+    else:
+        # 普通监督学习
+        module_class = MultiTaskModule if "aux_classes" in model_config["decode_head"] else SingleTaskModule
+        log.info(f"Using {module_class.__name__} for supervised learning")
+        module = module_class(model_config, loss=loss, mask_lc=config["mask_lc"]) if "mask_lc" in config else module_class(model_config, loss=loss)
+    
     module.init_pretrained()
+    log.info("Model initialized with pretrained weights")
 
     log.info("Preparing the trainer...")
-    logger = TensorBoardLogger(save_dir="outputs", name=exp_name)
+    # 创建增强的TensorBoard记录器
+    logger = TensorBoardLogger(
+        save_dir="outputs",
+        name=exp_name,
+        default_hp_metric=False,
+        log_graph=True,  # 记录模型结构
+    )
+    
+    # 添加超参数记录
+    logger.log_hyperparams({
+        "model_type": model_config["type"],
+        "backbone": model_config["backbone"]["type"],
+        "loss": loss,
+        "batch_size": config["data"]["batch_size_train"],
+        "patch_size": config["data"]["patch_size"],
+        "learning_rate": 1e-4,  # 从模块中获取
+        "weight_decay": 1e-4,
+        "max_epochs": config["trainer"]["max_epochs"],
+    })
+    
     config_dir = Path(logger.log_dir)
     config_dir.mkdir(parents=True, exist_ok=True)
     config.dump(config_dir / "config.py")
+    log.info(f"Config saved to {config_dir / 'config.py'}")
+    
+    # 增加更详细的回调函数
     callbacks = [
         ModelCheckpoint(
-            dirpath=Path(logger.log_dir) / "weights",
-            monitor="epoch",
+            dirpath=Path(logger.log_dir) / "weights" / "loss",
+            monitor="val_loss",
+            mode="min",
+            filename="model-{epoch:02d}-{val_loss:.4f}",
+            save_top_k=3,  # 保存val_loss最小的3个模型
+            every_n_epochs=1,
+            verbose=True,
+        ),
+        # 添加进度条回调
+        pytorch_lightning.callbacks.RichProgressBar(
+            refresh_rate=1,
+            leave=True,
+        ),
+        # 添加学习率监控
+        pytorch_lightning.callbacks.LearningRateMonitor(
+            logging_interval='step',
+            log_momentum=True,
+        ),
+        # 添加早停回调
+        pytorch_lightning.callbacks.EarlyStopping(
+            monitor='val_loss',
+            patience=20,
+            verbose=True,
+            mode='min',
+        ),
+        # 添加模型摘要回调
+        pytorch_lightning.callbacks.ModelSummary(
+            max_depth=2
+        ),
+        # 保存val_iou最高的3个模型
+        pytorch_lightning.callbacks.ModelCheckpoint(
+            dirpath=Path(logger.log_dir) / "weights" / "iou",
+            monitor="val_iou",
             mode="max",
-            filename="model-{epoch:02d}-{val_loss:.2f}",
-            save_top_k=6,
-            every_n_epochs=10,
-        )
+            filename="best-{epoch:02d}-{val_iou:.4f}",
+            save_top_k=3,
+            verbose=True,
+        ),
     ]
-    trainer = Trainer(**config["trainer"], callbacks=callbacks, logger=logger)
+    
+    # 设置详细的日志记录
+    trainer_config = config["trainer"].copy()
+    trainer_config.update({
+        "log_every_n_steps": 10,  # 每10步记录一次日志
+        "enable_progress_bar": True,
+        "enable_model_summary": True,
+    })
+    
+    trainer = Trainer(**trainer_config, callbacks=callbacks, logger=logger)
+    log.info(f"Trainer configuration: {trainer_config}")
+    log.info(f"Total epochs: {trainer_config.get('max_epochs', 'Not specified')}")
+    log.info(f"Training on device: {trainer_config.get('accelerator', 'cpu')}")
 
     log.info("Starting the training...")
     trainer.fit(module, datamodule=datamodule)
@@ -76,9 +236,18 @@ def test(
     ),
     predict: bool = ArgField(default=False, description="Generate predictions on the test set."),
 ):
+    # 设置随机种子确保结果可重现
+    setup_reproducible_training(SEED)
+    seed_everything(SEED, workers=True)
+    log.info(f"Random seed set to {SEED} for reproducibility")
+    
     log.info(f"Loading experiment from: {exp_path}")
-    config_path = exp_path / "config.py"
-    models_path = exp_path / "weights"
+    # 自动向上查找config.py
+    config_dir = exp_path
+    while not (config_dir / "config.py").exists() and config_dir != config_dir.parent:
+        config_dir = config_dir.parent
+    config_path = config_dir / "config.py"
+    models_path = exp_path
     # asserts to check the experiment folders
     assert exp_path.exists(), "Experiment folder does not exist."
     assert config_path.exists(), f"Config file not found in: {config_path}"
@@ -88,7 +257,18 @@ def test(
 
     # datamodule
     log.info("Preparing the data module...")
-    datamodule = EMSDataModule(**config["data"])
+    # 如果配置中没有seed参数，则添加默认值
+    if "seed" not in config["data"]:
+        config["data"]["seed"] = SEED
+    
+    # 检查是否为半监督学习配置
+    if "labeled_ratio" in config["data"] or "consistency_augmentation" in config["data"]:
+        from baseg.datamodules_semi import SemiSupervisedEMSDataModule
+        datamodule = SemiSupervisedEMSDataModule(**config["data"])
+        log.info("Using SemiSupervisedEMSDataModule for semi-supervised learning")
+    else:
+        datamodule = EMSDataModule(**config["data"])
+        log.info("Using EMSDataModule for supervised learning")
 
     # prepare the model
     checkpoint = checkpoint or find_best_checkpoint(models_path, "val_loss", "min")
@@ -112,7 +292,30 @@ def test(
     # prepare the model
     log.info("Preparing the model...")
     model_config = config["model"]
-    module_class = MultiTaskModule if "aux_classes" in model_config["decode_head"] else SingleTaskModule
+    
+    # 检查是否为半监督学习配置
+    if "labeled_ratio" in config["data"] or "consistency_augmentation" in config["data"]:
+        from baseg.modules.semi_supervised import SemiSupervisedModule
+        module_class = SemiSupervisedModule
+        log.info("Using SemiSupervisedModule for semi-supervised learning")
+        
+        # 半监督模块需要额外的参数
+        semi_config = config.get("semi_supervised", {})
+        module_opts = dict(
+            config=config["model"],
+            loss=config.get("loss", "bce"),
+            pseudo_threshold=semi_config.get("pseudo_threshold", 0.95),
+            consistency_weight=semi_config.get("consistency_weight", 1.0),
+            pseudo_weight=semi_config.get("pseudo_weight", 1.0),
+            ramp_up_epochs=semi_config.get("ramp_up_epochs", 10),
+            ema_decay=semi_config.get("ema_decay", 0.99),
+            use_ema_teacher=semi_config.get("use_ema_teacher", True),
+        )
+    else:
+        # 普通监督学习
+        module_class = MultiTaskModule if "aux_classes" in model_config["decode_head"] else SingleTaskModule
+        log.info(f"Using {module_class.__name__} for supervised learning")
+    
     module = module_class.load_from_checkpoint(checkpoint, **module_opts)
 
     logger = TensorBoardLogger(save_dir="outputs", name=config["name"], version=exp_path.stem)
@@ -184,5 +387,6 @@ def process_inference(
 
 
 if __name__ == "__main__":
-    seed_everything(95, workers=True)
+    # 在程序入口处设置随机种子
+    setup_reproducible_training(SEED)
     cli()

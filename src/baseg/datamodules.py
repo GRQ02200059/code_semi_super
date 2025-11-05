@@ -4,6 +4,7 @@ import albumentations as A
 from albumentations.pytorch import ToTensorV2
 from pytorch_lightning import LightningDataModule
 from torch.utils.data import DataLoader
+import numpy as np
 
 from baseg.datasets import EMSCropDataset, EMSImageDataset
 from baseg.samplers import SequentialTiledSampler
@@ -27,6 +28,7 @@ class EMSDataModule(LightningDataModule):
         batch_size_train: int = 8,
         batch_size_eval: int = 16,
         num_workers: int = 4,
+        seed: int = 42,
     ) -> None:
         super().__init__()
         self.root = root
@@ -35,6 +37,11 @@ class EMSDataModule(LightningDataModule):
         self.batch_size_train = batch_size_train
         self.batch_size_eval = batch_size_eval
         self.num_workers = num_workers
+        self.seed = seed
+        
+        # 设置Albumentations的随机种子
+        # Albumentations使用numpy的随机状态，所以设置numpy种子即可
+        np.random.seed(seed)
         self.train_transform = A.Compose(
             [
                 A.HorizontalFlip(p=0.5),
@@ -83,7 +90,7 @@ class EMSDataModule(LightningDataModule):
     def train_dataloader(self):
         return DataLoader(
             self.train_set,
-            sampler=RandomTiledSampler(self.train_set, tile_size=self.patch_size),
+            sampler=RandomTiledSampler(self.train_set, tile_size=self.patch_size, seed=self.seed),
             batch_size=self.batch_size_train,
             num_workers=self.num_workers,
             pin_memory=True,

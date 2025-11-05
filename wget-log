@@ -1,0 +1,4 @@
+--2025-06-22 17:59:45--  https://huggingface.co/microsoft/swin-small-patch4-window7-224/resolve/main/pytorch_model.bin
+Resolving huggingface.co (huggingface.co)... 2a03:2880:f12c:83:face:b00c:0:25de, 67.230.169.182
+Connecting to huggingface.co (huggingface.co)|2a03:2880:f12c:83:face:b00c:0:25de|:443... failed: Connection timed out.
+Connecting to huggingface.co (huggingface.co)|67.230.169.182|:443... failed: Connection refused.

@@ -7,8 +7,6 @@ from torch import nn
 from torch.optim import AdamW
 from torchmetrics import F1Score, JaccardIndex
 
-from baseg.models import build_model
-
 
 class BaseModule(LightningModule):
     def __init__(
@@ -18,6 +16,7 @@ class BaseModule(LightningModule):
         predict_callback: Optional[Callable] = None,
     ):
         super().__init__()
+        from baseg.models import build_model  # 延迟导入，避免循环依赖
         self.model = build_model(config)
         self.model.cfg = config
         self.tiler = tiler

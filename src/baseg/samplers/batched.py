@@ -12,6 +12,7 @@ class RandomTiledBatchSampler(TiledSampler):
         tile_size: int,
         batch_size: int,
         length: int = None,
+        seed: int = None,
     ):
         if not isinstance(batch_size, int) or isinstance(batch_size, bool) or batch_size <= 0:
             raise ValueError(
@@ -19,7 +20,9 @@ class RandomTiledBatchSampler(TiledSampler):
             )
         super().__init__(dataset, tile_size, length=length)
         self.batch_size = batch_size
-        self.indices = np.random.choice(len(self.dataset), len(self), replace=True)
+        self.seed = seed
+        self._rng = np.random.RandomState(seed) if seed is not None else np.random
+        self.indices = self._rng.choice(len(self.dataset), len(self), replace=True)
 
     def __len__(self):
         return super().__len__() // self.batch_size
@@ -28,6 +31,6 @@ class RandomTiledBatchSampler(TiledSampler):
         # sample a random image, then sample a random tile from that image
         for i in self.indices:
             width, height = self.shapes[i]
-            x = np.random.randint(0, width - self.tile_size + 1, self.batch_size)
-            y = np.random.randint(0, height - self.tile_size + 1, self.batch_size)
+            x = self._rng.randint(0, width - self.tile_size + 1, self.batch_size)
+            y = self._rng.randint(0, width - self.tile_size + 1, self.batch_size)
             yield [IndexedBounds(i, (x[j], y[j], self.tile_size, self.tile_size)) for j in range(self.batch_size)]

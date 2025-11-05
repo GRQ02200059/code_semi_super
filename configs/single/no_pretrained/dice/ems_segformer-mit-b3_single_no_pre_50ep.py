@@ -21,9 +21,4 @@ evaluation = dict(
     strategy=None,
     devices=1,
 )
-data = dict(
-    batch_size_train=32,
-    batch_size_eval=32,
-    num_workers=4,
-)
 loss="dice"

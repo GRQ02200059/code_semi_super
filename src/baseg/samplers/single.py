@@ -72,14 +72,17 @@ class RandomTiledSampler(TiledSampler):
         dataset: Dataset,
         tile_size: int,
         length: int = None,
+        seed: int = None,
     ):
         super().__init__(dataset, tile_size, length=length)
-        self.indices = np.random.choice(len(self.dataset), len(self), replace=True)
+        self.seed = seed
+        self._rng = np.random.RandomState(seed) if seed is not None else np.random
+        self.indices = self._rng.choice(len(self.dataset), len(self), replace=True)
 
     def __iter__(self):
         # sample a random image, then sample a random tile from that image
         for i in self.indices:
             width, height = self.shapes[i]
-            x = np.random.randint(0, width - self.tile_size + 1, 1)
-            y = np.random.randint(0, height - self.tile_size + 1, 1)
+            x = self._rng.randint(0, width - self.tile_size + 1, 1)
+            y = self._rng.randint(0, height - self.tile_size + 1, 1)
             yield IndexedBounds(i, (x, y, self.tile_size, self.tile_size))

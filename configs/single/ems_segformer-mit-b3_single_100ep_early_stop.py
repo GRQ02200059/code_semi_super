@@ -1,18 +1,23 @@
 _base_ = [
-    "../models/upernet_rn50.py",
+    "../models/segformer_mit-b3_no_pre.py",
     "../datasets/ems.py",
 ]
-name = "upernet-rn50_single_imnet_weight5_100ep"
+name = "segformer-mit-b3_single_no_pre_100ep_early_stop"
 trainer = dict(
-    max_epochs=10,
+    max_epochs=100,
     precision=16,
     accelerator="gpu",
     strategy=None,
     devices=1,
+)
+data = dict(
+    batch_size_train=32,
+    batch_size_eval=32,
+    num_workers=8,
 )
 evaluation = dict(
     precision=16,
     accelerator="gpu",
     strategy=None,
     devices=1,
-)
+) 
