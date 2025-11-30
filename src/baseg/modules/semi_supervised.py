@@ -26,6 +26,11 @@ class SemiSupervisedModule(BaseModule):
         ramp_up_epochs: int = 10,        # 权重渐进增加的轮数
         ema_decay: float = 0.99,         # 教师模型EMA衰减率
         use_ema_teacher: bool = True,    # 是否使用EMA教师模型
+        # 多尺度一致性参数
+        use_multiscale: bool = False,    # 是否使用多尺度一致性
+        multiscale_weight: float = 0.5,  # 多尺度一致性损失权重
+        multiscale_scales: list = None,  # 多尺度缩放因子列表
+        multiscale_on_labeled_only: bool = False,  # 是否仅在有标注数据上使用
     ):
         super().__init__(config, tiler, predict_callback)
         
@@ -68,8 +73,17 @@ class SemiSupervisedModule(BaseModule):
             'positive_pseudo': 0
         }
         
+        # 多尺度一致性参数
+        self.use_multiscale = use_multiscale
+        self.multiscale_weight = multiscale_weight
+        self.multiscale_scales = multiscale_scales if multiscale_scales is not None else [0.75, 1.0, 1.25]
+        self.multiscale_on_labeled_only = multiscale_on_labeled_only
+        
         log.info(f"初始化半监督学习模块: threshold={pseudo_threshold}, "
                 f"consistency_weight={consistency_weight}, pseudo_weight={pseudo_weight}")
+        if self.use_multiscale:
+            log.info(f"✅ 多尺度一致性已启用: weight={multiscale_weight}, scales={self.multiscale_scales}, "
+                    f"on_labeled_only={multiscale_on_labeled_only}")
 
     def _init_teacher_model(self):
         """初始化EMA教师模型"""
@@ -153,6 +167,55 @@ class SemiSupervisedModule(BaseModule):
         consistency_loss = self.consistency_criterion(prob1, prob2)
         return consistency_loss
 
+    def _compute_multiscale_consistency_loss(self, images: torch.Tensor) -> torch.Tensor:
+        """计算多尺度一致性损失
+        
+        Args:
+            images: 输入图像 [B, C, H, W]
+            
+        Returns:
+            multiscale_loss: 多尺度一致性损失
+        """
+        if not self.use_multiscale or len(self.multiscale_scales) < 2:
+            return torch.tensor(0.0, device=images.device)
+        
+        B, C, H, W = images.shape
+        predictions = []
+        
+        # 对每个尺度进行预测
+        for scale in self.multiscale_scales:
+            if scale == 1.0:
+                # 原始尺度
+                pred = self.model(images)
+            else:
+                # 缩放图像
+                new_h, new_w = int(H * scale), int(W * scale)
+                scaled_images = F.interpolate(images, size=(new_h, new_w), 
+                                             mode='bilinear', align_corners=False)
+                pred = self.model(scaled_images)
+                # 将预测结果缩放回原始尺寸
+                pred = F.interpolate(pred, size=(H, W), 
+                                    mode='bilinear', align_corners=False)
+            
+            if pred.dim() == 4:
+                pred = pred.squeeze(1)  # [B, H, W]
+            predictions.append(torch.sigmoid(pred))
+        
+        # 计算所有尺度对之间的一致性损失
+        total_loss = torch.tensor(0.0, device=images.device)
+        num_pairs = 0
+        
+        for i in range(len(predictions)):
+            for j in range(i + 1, len(predictions)):
+                pair_loss = self.consistency_criterion(predictions[i], predictions[j])
+                total_loss = total_loss + pair_loss
+                num_pairs += 1
+        
+        if num_pairs > 0:
+            total_loss = total_loss / num_pairs
+        
+        return total_loss
+
     def training_step(self, batch: Any, batch_idx: int):
         # 初始化教师模型
         if self.teacher_model is None and self.use_ema_teacher:
@@ -195,6 +258,15 @@ class SemiSupervisedModule(BaseModule):
         
         supervised_loss = self.criterion_supervised(pred_labeled.squeeze(1), y_labeled.float())
         total_loss += supervised_loss
+        
+        # === 多尺度一致性损失（有标注数据）===
+        multiscale_loss_labeled = torch.tensor(0.0, device=x_labeled.device)
+        if self.use_multiscale:
+            # 获取当前多尺度权重（也使用ramp up）
+            current_multiscale_weight = self.multiscale_weight * (consistency_weight / self.consistency_weight if self.consistency_weight > 0 else 1.0)
+            multiscale_loss_labeled = self._compute_multiscale_consistency_loss(x_labeled)
+            total_loss += current_multiscale_weight * multiscale_loss_labeled
+            self.log("multiscale_loss_labeled", multiscale_loss_labeled, on_step=True)
         
         # === 无标注数据的半监督学习 ===
         if unlabeled_data is not None and len(unlabeled_data["S2L2A"]) > 0:
@@ -261,6 +333,13 @@ class SemiSupervisedModule(BaseModule):
                 total_loss += consistency_weight * consistency_loss
                 
                 self.log("consistency_loss", consistency_loss, on_step=True, prog_bar=True)
+            
+            # 5. 多尺度一致性损失（无标注数据）
+            if self.use_multiscale and not self.multiscale_on_labeled_only:
+                current_multiscale_weight = self.multiscale_weight * (consistency_weight / self.consistency_weight if self.consistency_weight > 0 else 1.0)
+                multiscale_loss_unlabeled = self._compute_multiscale_consistency_loss(x_unlabeled)
+                total_loss += current_multiscale_weight * multiscale_loss_unlabeled
+                self.log("multiscale_loss_unlabeled", multiscale_loss_unlabeled, on_step=True)
         
         # 更新教师模型
         self._update_teacher_model()

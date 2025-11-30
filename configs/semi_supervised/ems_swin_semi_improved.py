@@ -19,7 +19,7 @@ trainer = dict(
 # 早停配置
 early_stopping = dict(
     monitor="val_iou",     # 监控IoU而不是loss
-    patience=30,           # 减少patience
+    patience=30,           # 连续30个epoch无提升则停止
     mode="max",            # IoU越大越好
     verbose=True,
 )

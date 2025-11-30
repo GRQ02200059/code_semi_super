@@ -121,16 +121,30 @@ def train(
         
         # 半监督模块需要额外的参数
         semi_config = config.get("semi_supervised", {})
-        module = module_class(
-            model_config,
-            loss=loss,
-            pseudo_threshold=semi_config.get("pseudo_threshold", 0.95),
-            consistency_weight=semi_config.get("consistency_weight", 1.0),
-            pseudo_weight=semi_config.get("pseudo_weight", 1.0),
-            ramp_up_epochs=semi_config.get("ramp_up_epochs", 10),
-            ema_decay=semi_config.get("ema_decay", 0.99),
-            use_ema_teacher=semi_config.get("use_ema_teacher", True),
-        )
+        
+        # 基础参数（所有半监督模块都需要）
+        module_params = {
+            "config": model_config,
+            "loss": loss,
+            "pseudo_threshold": semi_config.get("pseudo_threshold", 0.95),
+            "consistency_weight": semi_config.get("consistency_weight", 1.0),
+            "pseudo_weight": semi_config.get("pseudo_weight", 1.0),
+            "ramp_up_epochs": semi_config.get("ramp_up_epochs", 10),
+            "ema_decay": semi_config.get("ema_decay", 0.99),
+            "use_ema_teacher": semi_config.get("use_ema_teacher", True),
+        }
+        
+        # 多尺度一致性参数
+        if semi_config.get("use_multiscale", False):
+            module_params["use_multiscale"] = True
+            module_params["multiscale_weight"] = semi_config.get("multiscale_weight", 0.5)
+            module_params["multiscale_scales"] = semi_config.get("multiscale_scales", [0.75, 1.0, 1.25])
+            module_params["multiscale_on_labeled_only"] = semi_config.get("multiscale_on_labeled_only", False)
+            log.info(f"✅ 多尺度一致性已启用: weight={module_params['multiscale_weight']}, "
+                    f"scales={module_params['multiscale_scales']}, "
+                    f"on_labeled_only={module_params['multiscale_on_labeled_only']}")
+        
+        module = module_class(**module_params)
     else:
         # 普通监督学习
         module_class = MultiTaskModule if "aux_classes" in model_config["decode_head"] else SingleTaskModule
@@ -173,7 +187,7 @@ def train(
             monitor="val_loss",
             mode="min",
             filename="model-{epoch:02d}-{val_loss:.4f}",
-            save_top_k=3,  # 保存val_loss最小的3个模型
+            save_top_k=6,  # 保存val_loss最小的6个模型
             every_n_epochs=1,
             verbose=True,
         ),
@@ -187,27 +201,36 @@ def train(
             logging_interval='step',
             log_momentum=True,
         ),
-        # 添加早停回调
-        pytorch_lightning.callbacks.EarlyStopping(
-            monitor='val_loss',
-            patience=20,
-            verbose=True,
-            mode='min',
-        ),
         # 添加模型摘要回调
         pytorch_lightning.callbacks.ModelSummary(
             max_depth=2
         ),
-        # 保存val_iou最高的3个模型
+        # 保存val_iou最高的6个模型
         pytorch_lightning.callbacks.ModelCheckpoint(
             dirpath=Path(logger.log_dir) / "weights" / "iou",
             monitor="val_iou",
             mode="max",
             filename="best-{epoch:02d}-{val_iou:.4f}",
-            save_top_k=3,
+            save_top_k=6,
             verbose=True,
         ),
     ]
+    
+    # 根据配置添加早停回调（如果配置中有early_stopping）
+    if "early_stopping" in config:
+        early_stopping_config = config["early_stopping"]
+        callbacks.append(
+            pytorch_lightning.callbacks.EarlyStopping(
+                monitor=early_stopping_config.get("monitor", "val_loss"),
+                patience=early_stopping_config.get("patience", 20),
+                verbose=early_stopping_config.get("verbose", True),
+                mode=early_stopping_config.get("mode", "min"),
+            )
+        )
+        log.info(f"Early Stopping enabled: monitor={early_stopping_config.get('monitor')}, "
+                f"patience={early_stopping_config.get('patience')}")
+    else:
+        log.info("Early Stopping disabled - will train for full max_epochs")
     
     # 设置详细的日志记录
     trainer_config = config["trainer"].copy()
@@ -271,7 +294,20 @@ def test(
         log.info("Using EMSDataModule for supervised learning")
 
     # prepare the model
-    checkpoint = checkpoint or find_best_checkpoint(models_path, "val_loss", "min")
+    # 优先查找IoU最佳模型，如果没有则查找loss最佳模型
+    if checkpoint is None:
+        iou_path = models_path / "weights" / "iou"
+        loss_path = models_path / "weights" / "loss"
+        
+        if iou_path.exists() and list(iou_path.glob("*.ckpt")):
+            checkpoint = find_best_checkpoint(models_path, "val_iou", "max")
+            log.info("Found IoU-based checkpoints, using best IoU model")
+        elif loss_path.exists() and list(loss_path.glob("*.ckpt")):
+            checkpoint = find_best_checkpoint(models_path, "val_loss", "min")
+            log.info("Found Loss-based checkpoints, using best loss model")
+        else:
+            checkpoint = find_best_checkpoint(models_path, "val_loss", "min")
+    
     log.info(f"Using checkpoint: {checkpoint}")
 
     module_opts = dict(config=config["model"])

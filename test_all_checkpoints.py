@@ -24,7 +24,9 @@ from mmengine import Config
 from pytorch_lightning import Trainer, seed_everything
 
 from baseg.datamodules_semi import SemiSupervisedEMSDataModule
+from baseg.modules.semi_supervised import SemiSupervisedModule
 from baseg.modules.semi_supervised_contrastive import SemiSupervisedContrastiveModule
+from baseg.modules.semi_supervised_uncertainty import SemiSupervisedUncertaintyModule
 
 
 def set_seed(seed=42):
@@ -90,23 +92,54 @@ def test_checkpoint(ckpt_info, exp_dir, datamodule):
         semi_config = config.get("semi_supervised", {})
         loss = config.get("loss", "bce")
         
-        # 创建模块
-        module = SemiSupervisedContrastiveModule(
-            model_config,
-            loss=loss,
-            pseudo_threshold=semi_config.get("pseudo_threshold", 0.9),
-            consistency_weight=semi_config.get("consistency_weight", 2.0),
-            pseudo_weight=semi_config.get("pseudo_weight", 1.5),
-            ramp_up_epochs=semi_config.get("ramp_up_epochs", 10),
-            ema_decay=semi_config.get("ema_decay", 0.999),
-            use_ema_teacher=semi_config.get("use_ema_teacher", True),
-            use_contrastive=semi_config.get("use_contrastive", True),
-            contrastive_weight=semi_config.get("contrastive_weight", 0.5),
-            contrastive_temperature=semi_config.get("contrastive_temperature", 0.07),
-            contrastive_mode=semi_config.get("contrastive_mode", "global"),
-            projection_dim=semi_config.get("projection_dim", 128),
-            projection_hidden_dim=semi_config.get("projection_hidden_dim", 256),
-        )
+        # 根据配置自动选择模块类型
+        use_contrastive = semi_config.get("use_contrastive", False)
+        use_uncertainty = semi_config.get("use_uncertainty", False)
+        
+        if use_contrastive:
+            log.info("使用 SemiSupervisedContrastiveModule")
+            module = SemiSupervisedContrastiveModule(
+                model_config,
+                loss=loss,
+                pseudo_threshold=semi_config.get("pseudo_threshold", 0.9),
+                consistency_weight=semi_config.get("consistency_weight", 2.0),
+                pseudo_weight=semi_config.get("pseudo_weight", 1.5),
+                ramp_up_epochs=semi_config.get("ramp_up_epochs", 10),
+                ema_decay=semi_config.get("ema_decay", 0.999),
+                use_ema_teacher=semi_config.get("use_ema_teacher", True),
+                use_contrastive=True,
+                contrastive_weight=semi_config.get("contrastive_weight", 0.5),
+                contrastive_temperature=semi_config.get("contrastive_temperature", 0.07),
+                contrastive_mode=semi_config.get("contrastive_mode", "global"),
+                projection_dim=semi_config.get("projection_dim", 128),
+                projection_hidden_dim=semi_config.get("projection_hidden_dim", 256),
+            )
+        elif use_uncertainty:
+            log.info("使用 SemiSupervisedUncertaintyModule")
+            module = SemiSupervisedUncertaintyModule(
+                model_config,
+                loss=loss,
+                pseudo_threshold=semi_config.get("pseudo_threshold", 0.9),
+                consistency_weight=semi_config.get("consistency_weight", 2.0),
+                pseudo_weight=semi_config.get("pseudo_weight", 1.5),
+                ramp_up_epochs=semi_config.get("ramp_up_epochs", 10),
+                ema_decay=semi_config.get("ema_decay", 0.999),
+                use_ema_teacher=semi_config.get("use_ema_teacher", True),
+                use_uncertainty=True,
+                uncertainty_weight=semi_config.get("uncertainty_weight", 0.5),
+            )
+        else:
+            log.info("使用基础 SemiSupervisedModule")
+            module = SemiSupervisedModule(
+                model_config,
+                loss=loss,
+                pseudo_threshold=semi_config.get("pseudo_threshold", 0.9),
+                consistency_weight=semi_config.get("consistency_weight", 2.0),
+                pseudo_weight=semi_config.get("pseudo_weight", 1.5),
+                ramp_up_epochs=semi_config.get("ramp_up_epochs", 10),
+                ema_decay=semi_config.get("ema_decay", 0.999),
+                use_ema_teacher=semi_config.get("use_ema_teacher", True),
+            )
         
         # 创建训练器
         trainer = Trainer(
